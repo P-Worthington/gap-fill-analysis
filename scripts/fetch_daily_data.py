@@ -1,64 +1,75 @@
+import yfinance as yf
+import sqlite3
 import os
-import requests
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 
-# Load environment variables from .env file (e.g., your API key)
-load_dotenv()
+# Set up the path to the database
+DB_PATH = os.path.join("data", "sp500.db")
 
-# Alpha Vantage API setup
-API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
-SYMBOL = "SPY"  # We're using the SPY ETF as a proxy for the S&P 500
-API_URL = "https://www.alphavantage.co/query"
+# Ensure the data directory exists
+os.makedirs("data", exist_ok=True)
 
-def get_daily_data():
-    # Define API parameters to get daily time series (last 100 days)
-    params = {
-        "function": "TIME_SERIES_DAILY",
-        "symbol": SYMBOL,
-        "apikey": API_KEY,
-        "outputsize": "compact"  # only returns recent ~100 data points
-    }
+# Connect to the SQLite database
+conn = sqlite3.connect(DB_PATH)
+c = conn.cursor()
 
-    # Make the API request
-    response = requests.get(API_URL, params=params)
-    data = response.json()
+# Create the table if it doesn't exist
+c.execute("""
+CREATE TABLE IF NOT EXISTS sp500_gaps (
+    date TEXT PRIMARY KEY,
+    previous_close REAL,
+    open REAL,
+    gap_size REAL,
+    gap_type TEXT,
+    gap_filled INTEGER,
+    filled_time TEXT
+);
+""")
 
-    # Extract the daily prices dictionary
-    time_series = data.get("Time Series (Daily)", {})
-    if not time_series:
-        raise Exception("Failed to fetch daily time series data.")
+# Get the most recent date in the database
+c.execute("SELECT MAX(date) FROM sp500_gaps")
+result = c.fetchone()
+last_date = result[0]
 
-    # Get the most recent two trading dates (sorted in reverse chronological order)
-    dates = sorted(time_series.keys(), reverse=True)
-    if len(dates) < 2:
-        raise Exception("Not enough data to calculate gap.")
+if last_date:
+    print(f"Last recorded date: {last_date}")
+    start_date = (datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+else:
+    print("No existing data found. Fetching 5 years of SPY data...")
+    start_date = (datetime.today() - timedelta(days=5*365)).strftime("%Y-%m-%d")
 
-    today_str, yesterday_str = dates[0], dates[1]
+# Download historical SPY data from the appropriate start date
+spy = yf.Ticker("SPY")
+hist = spy.history(start=start_date)
 
-    # Extract today’s open and yesterday’s close
-    today_open = float(time_series[today_str]["1. open"])
-    previous_close = float(time_series[yesterday_str]["4. close"])
+print(f"Fetched {len(hist)} rows of daily data starting from {start_date}.")
 
-    # Determine the gap type
-    if today_open > previous_close:
+# Iterate through data and insert into DB
+for i in range(1, len(hist)):
+    today = hist.iloc[i]
+    prev = hist.iloc[i - 1]
+
+    date = today.name.strftime("%Y-%m-%d")
+    previous_close = round(prev["Close"], 2)
+    open_price = round(today["Open"], 2)
+    gap_size = round(open_price - previous_close, 2)
+    
+    if gap_size > 0:
         gap_type = "up"
-    elif today_open < previous_close:
+    elif gap_size < 0:
         gap_type = "down"
     else:
         gap_type = "none"
 
-    # Return all relevant data
-    return {
-        "date": today_str,
-        "previous_close": previous_close,
-        "open": today_open,
-        "gap_type": gap_type
-    }
+    # Insert or ignore if the date already exists
+    c.execute("""
+        INSERT OR IGNORE INTO sp500_gaps
+        (date, previous_close, open, gap_size, gap_type, gap_filled, filled_time)
+        VALUES (?, ?, ?, ?, ?, NULL, NULL)
+    """, (date, previous_close, open_price, gap_size, gap_type))
 
-# If this script is run directly, fetch and print the gap data
-if __name__ == "__main__":
-    gap_info = get_daily_data()
-    print("Gap Data:")
-    for k, v in gap_info.items():
-        print(f"{k}: {v}")
+# Commit and close
+conn.commit()
+conn.close()
+
+print("Data written to database successfully.")
